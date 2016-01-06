@@ -56,6 +56,7 @@
 #include <signal.h>
 #include <errno.h>
 #include <pthread.h>
+#include <nuttx/time.h>
 
 #include "dhry.h"
 
@@ -230,39 +231,18 @@ int cpuloadgen_main(int argc, char *argv[])
 	int i, ret, load;
 	long int duration2;
 
-	cpu_count = 1;
-	dprintf("main: found %d CPU cores.\n", cpu_count);
-	if (argc > cpu_count + 2) {
-		fprintf(stderr, "cpuloadgen: too many arguments!\n\n");
-		usage();
-		return -EINVAL;
-	}
 
-	/* Allocate buffers */
-	threads = malloc(cpu_count * sizeof(pthread_t));
-	cpuloads = malloc(cpu_count * sizeof(int));
-	if ((threads == NULL) || (cpuloads == NULL)) {
-		fprintf(stderr, "cpuloadgen: could not allocate buffers!!!\n");
-		return -ENOMEM;
-	}
-
-	/* Initialize variables */
-	for (i = 0; i < cpu_count; i++) {
-		threads[i] = -1;
-		cpuloads[i] = 100;
-	}
 	duration = -1;
 
 	/* Parse user arguments */
 	if (argc >= 2) {
 		dprintf("main: argv[1]=%s\n", argv[1]);
-		ret = sscanf(argv[i], "%d", &load);
+		ret = sscanf(argv[1], "%d", &load);
 		if ((ret != 1) ||
 			(load < 1) || (load > 100)) {
 			return einval(argv[0]);
 		}
-		cpuloads[0] = load;
-		dprintf("Load assigned to CPU0: %d%%\n", cpuloads[0]);
+		dprintf("Load assigned to CPU0: %d%%\n", load);
 	}
 	if (argc == 3) {
 		dprintf("main: argv[2]=%s\n", argv[2]);
@@ -274,36 +254,8 @@ int cpuloadgen_main(int argc, char *argv[])
 		dprintf("Duration of the load generation: %lds\n", duration);
 	}
 
-	/* Start load generation on cores accordingly */
-	for (i = 0; i < cpu_count; i++) {
-		if (cpuloads[i] == -1) {
-			dprintf("main: no load to be generated on CPU%d\n", i);
-			continue;
-		}
-		/*
-		 * Why is a mutex needed here?
-		 * There is a race condition between this loop which updates
-		 * variable i and thread_loadgen() which also reads it.
-		 * Hence locking a mutex here, and unlocking it in
-		 * thread_loadgen() after the value was retrieved and saved.
-		 */
-		pthread_mutex_lock(&mutex1);
-		ret = pthread_create(&threads[i], NULL, thread_loadgen, &i);
-		if (ret != 0) {
-			fprintf(stderr, "cpuloadgen: failed to fork %d! (%d)",
-			i, ret);
-			continue;
-		}
-	}
 
-	for (i = 0; i < cpu_count; i++) {
-		if (cpuloads[i] == -1) {
-			continue;
-		}
-		pthread_join(threads[i], NULL);
-	}
-
-	free_buffers();
+	loadgen(0, load, duration);
 
 	printf("\ndone.\n\n");
 	return 0;
@@ -327,16 +279,16 @@ int loadgen(unsigned int cpu, unsigned int load, unsigned int duration)
 {
 	struct timeval tv_loadgen_start, tv_loadgen_now, tv_loadgen_time;
 	struct timeval tv_dhry_start, tv_dhry_end, tv_dhry_time;
-    uint64_t dhry_time_usec, total_time_usec, idle_time_usec;
-    #ifdef CPULOADGEN_DEBUG
-    struct timeval tv_idle_start, tv_idle_end, tv_idle_time;
-    unsigned int real_cpu_load;
-    uint64_t real_idle_time_usec;
-    #endif
+	useconds_t dhry_time_usec, total_time_usec, idle_time_usec;
+#ifdef CPULOADGEN_DEBUG
+	struct timeval tv_idle_start, tv_idle_end, tv_idle_time;
+	unsigned int real_cpu_load;
+	useconds_t real_idle_time_usec;
+#endif
 
-    if ((!load) || (!duration)) {
-        return -EINVAL;
-    }
+	if ((!load) || (!duration)) {
+	return -EINVAL;
+	}
 
 	printf("Generating %3u%% load on CPU%u...\n", load, cpu);
 	gettimeofday(&tv_loadgen_start, NULL);
@@ -348,80 +300,75 @@ int loadgen(unsigned int cpu, unsigned int load, unsigned int duration)
 		while (1) {
 			/* Generate load (100%) */
 			gettimeofday(&tv_dhry_start, NULL);
-            printf("1\n");
-            fflush(stdout);
-			dhryStone(10);
-            printf("2\n");
-            fflush(stdout);
+			dhryStone(10000);
 			gettimeofday(&tv_dhry_end, NULL);
 
-            timersub(&tv_dhry_end, &tv_dhry_start, &tv_dhry_time);
-            dhry_time_usec = tv_dhry_time.tv_usec;
-            dhry_time_usec += tv_dhry_time.tv_sec * USEC_PER_SEC;
-			dprintf("%s(): CPU%u dhrystone run time: %luus\n", __func__,
-                    cpu, dhry_time_usec);
+			timersub(&tv_dhry_end, &tv_dhry_start, &tv_dhry_time);
+			dhry_time_usec = timeval_to_usec(&tv_dhry_time);
+			dprintf("%s(): CPU%u dhrystone run time: %lu us\n", __func__,
+			cpu, dhry_time_usec);
 
-			/* Compute needed idle time */
-            total_time_usec = dhry_time_usec;
-            total_time_usec *= (100 * 100) / (load + 1);
-            total_time_usec /= 100;
+			dprintf("start %lu %lu\n", tv_dhry_start.tv_sec, tv_dhry_start.tv_usec);
+			dprintf("end %lu %lu\n", tv_dhry_end.tv_sec, tv_dhry_end.tv_usec);
+
+				/* Compute needed idle time */
+			total_time_usec = dhry_time_usec;
+			total_time_usec *= (100 * 100) / (load + 1);
+			total_time_usec /= 100;
 			dprintf("%s(): CPU%u total time: %luus\n", __func__, cpu,
-				    total_time_usec);
+					total_time_usec);
 			idle_time_usec = total_time_usec - dhry_time_usec;
 			dprintf("%s(): CPU%u computed idle time: %luus\n",
-                    __func__, cpu, idle_time_usec);
+				__func__, cpu, idle_time_usec);
 
 			/* Generate idle time */
-			#ifdef CPULOADGEN_DEBUG
+#ifdef CPULOADGEN_DEBUG
 			gettimeofday(&tv_idle_start, NULL);
-			#endif
-			usleep(idle_time_usec);
-			#ifdef CPULOADGEN_DEBUG
+#endif
+			/*nuttx time is sleeping between 10ms to 20ms more */
+			if (idle_time_usec > 10000)
+				usleep(idle_time_usec - 10000);
+#ifdef CPULOADGEN_DEBUG
 			gettimeofday(&tv_idle_end, NULL);
-            timersub(&tv_idle_end, &tv_idle_start, &tv_idle_time);
-            real_idle_time_usec = tv_idle_time.tv_usec;
-            real_idle_time_usec += tv_idle_time.tv_sec * USEC_PER_SEC;
+			timersub(&tv_idle_end, &tv_idle_start, &tv_idle_time);
+			real_idle_time_usec = timeval_to_usec(&tv_idle_time);
 			dprintf("%s(): CPU%u effective idle time: %luus\n",
-				    __func__, cpu, real_idle_time_usec);
-            real_cpu_load = (100 * dhry_time_usec);
-            real_cpu_load /= (dhry_time_usec + real_idle_time_usec);
+					__func__, cpu, real_idle_time_usec);
+			real_cpu_load = (100 * dhry_time_usec);
+			real_cpu_load /= (dhry_time_usec + real_idle_time_usec);
 			dprintf("%s(): CPU%u effective CPU Load: %u%%\n",
-				    __func__, cpu, real_cpu_load);
-            if (real_cpu_load != load) {
-                printf("Warning: CPU%u: generated %u%% load instead of %u%%\n",
-                       cpu, real_cpu_load, load);
-            }
-			#endif
+					__func__, cpu, real_cpu_load);
+			if (real_cpu_load != load) {
+				printf("Warning: CPU%u: generated %u%% load instead of %u%%\n",
+				cpu, real_cpu_load, load);
+			}
+#endif
 
-            gettimeofday(&tv_loadgen_now, NULL);
-            timersub(&tv_loadgen_now, &tv_loadgen_start, &tv_loadgen_time);
-            #ifdef CPULOADGEN_DEBUG
-            dprintf("%s(): CPU%u elapsed time: %lus %luus\n", __func__,
-                    cpu, tv_loadgen_time.tv_sec, tv_loadgen_time.tv_usec);
-            #endif
-            if (tv_loadgen_time.tv_sec >= duration) {
-                break;
-            }
+			gettimeofday(&tv_loadgen_now, NULL);
+			timersub(&tv_loadgen_now, &tv_loadgen_start, &tv_loadgen_time);
+#ifdef CPULOADGEN_DEBUG
+			dprintf("%s(): CPU%u elapsed time: %lus %luus\n", __func__,
+				cpu, tv_loadgen_time.tv_sec, tv_loadgen_time.tv_usec);
+#endif
+			if (tv_loadgen_time.tv_sec >= duration)
+				break;
 		}
 	} else {
-            printf("la\n");
-            return 0;
 		while (1) {
 			dhryStone(1000000);
 			gettimeofday(&tv_loadgen_now, NULL);
 			timersub(&tv_loadgen_now, &tv_loadgen_start, &tv_loadgen_time);
-            #ifdef CPULOADGEN_DEBUG
-            dprintf("%s(): CPU%u elapsed time: %lus %luus\n", __func__,
-                    cpu, tv_loadgen_time.tv_sec, tv_loadgen_time.tv_usec);
-            #endif
-            if (tv_loadgen_time.tv_sec >= duration) {
-                break;
-            }
+#ifdef CPULOADGEN_DEBUG
+			dprintf("%s(): CPU%u elapsed time: %lus %luus\n", __func__,
+				cpu, tv_loadgen_time.tv_sec, tv_loadgen_time.tv_usec);
+#endif
+			if (tv_loadgen_time.tv_sec >= duration)
+				break;
 		}
 	}
 
 	dprintf("Load Generation on CPU%u completed.\n", cpu);
-    return 0;
+	return 0;
 }
 
 
@@ -495,6 +442,8 @@ void dhryStone(unsigned int iterations)
 		Proc_2 (&Int_1_Loc);
 		/* Int_1_Loc == 5 */
 	}
+	free(Ptr_Glob);
+	free(Next_Ptr_Glob);
 }
 
 
